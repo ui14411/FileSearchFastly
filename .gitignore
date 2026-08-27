@@ -1,0 +1,45 @@
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.VC.db
+
+# Build
+out/
+build/
+cmake-build-*/
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# Visual Studio generated files
+*.obj
+*.pdb
+*.ilk
+*.tlog
+
+# Executables
+*.exe
+*.dll
+
+# Qt generated files
+moc_*.cpp
+qrc_*.cpp
+ui_*.h
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+Thumbs.db
+.DS_Store
+
+# aps
+*.aps
+
+# json
+*.json
