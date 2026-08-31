@@ -109,7 +109,7 @@ void DriveScanner::startScanner()
 }
 
 // NTFS USN 全量枚举（需管理员；失败返回 false 由调用方降级遍历）
-// 启用备份特权：FSCTL_GET_NTFS_FILE_RECORD 必需（2026-08 补充）
+// 启用备份特权：FSCTL_GET_NTFS_FILE_RECORD 必需
 static bool enableBackupPrivilege()
 {
     HANDLE hToken = nullptr;
@@ -882,6 +882,7 @@ void DriveScanner::scannerFile()
             std::wstring fullpath = current;
             if (fullpath.empty() || fullpath.back() != L'\\')
                 fullpath += L'\\';
+            fullpath += data.cFileName;   // 必须拼上文件名，否则 path 全是目录路径（UNIQUE 冲突互相覆盖 + 子目录被 visited 跳过）
             if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
                 QString name = QString::fromStdWString(data.cFileName);
                 FileInfo file;
