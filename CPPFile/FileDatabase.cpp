@@ -6,6 +6,127 @@
 #include <math.h>
 #include <QCoreApplication>
 
+//工具函数
+namespace {
+    //同步搜索（独立只读连接：WAL 并发读，不排 dbThread
+    QList<FileInfo> runSearchSync(const QString& sql, const QList<QVariant>& binds)
+    {
+        QList<FileInfo> res;
+        const QString connName = QStringLiteral("search_%1").arg(
+            reinterpret_cast<quintptr>(QThread::currentThreadId()));
+        {
+            QSqlDatabase sdb = QSqlDatabase::addDatabase("QSQLITE", connName);
+            sdb.setDatabaseName(QCoreApplication::applicationDirPath() + "/fileindex.db");
+            sdb.setConnectOptions("QSQLITE_OPEN_READONLY");   // 只读：扫描写库可并发
+            if (sdb.open())
+            {
+                QSqlQuery q(sdb);
+                q.prepare(sql);
+                for (const QVariant& v : binds)
+                    q.addBindValue(v);
+                if (q.exec())
+                {
+                    while (q.next())
+                    {
+                        FileInfo f;
+                        f.name = q.value(0).toString();
+                        f.path = q.value(1).toString();
+                        f.suffix = q.value(2).toString();
+                        f.size = q.value(3).toLongLong();
+                        f.modifiedTime = QDateTime::fromSecsSinceEpoch(q.value(4).toLongLong());
+                        f.isFolder = q.value(5).toInt() == 1;
+                        f.id = q.value(6).toLongLong();
+                        res.append(f);
+                    }
+                }
+            }
+            sdb.close();
+        }
+        QSqlDatabase::removeDatabase(connName);
+        return res;
+    }
+
+    QString escapeLike(const QString& kw)
+    {
+        QString e = kw;
+        e.replace(QLatin1Char('\\'), QStringLiteral("\\\\"))
+            .replace(QLatin1Char('%'), QStringLiteral("\\%"))
+            .replace(QLatin1Char('_'), QStringLiteral("\\_"));
+        return e;
+    }
+
+    static QString orderDir(int sortType)
+    {
+        return (sortType % 2) ? QStringLiteral("DESC") : QStringLiteral("ASC");
+    }
+
+    static QString orderKeyExpr(int sortType)
+    {
+        return (sortType / 2 == 0) ? QStringLiteral("name COLLATE NOCASE")
+            : (sortType / 2 == 1) ? QStringLiteral("size")
+            : QStringLiteral("modifiedTime");
+    }
+
+    QVariant cursorKeyOf(const FileInfo& f, int sortType)
+    {
+        switch (sortType / 2) {
+        case 0:  return f.name;                              // TEXT  ← 对应 name COLLATE NOCASE
+        case 1:  return f.size;                              // INTEGER
+        default: return f.modifiedTime.toSecsSinceEpoch();   // INTEGER（纪元秒，不是 QDateTime！）
+        }
+    }
+
+    PagedResult searchPage(const QString& whereSql, const QList<QVariant>& whereBinds,
+        int sortType, bool notIndexed,
+        const QVariant& curKey, qint64 curId, int limit)
+    {
+        const QString keyExpr = orderKeyExpr(sortType);   // 可能是 "name COLLATE NOCASE"
+        const QString dir = orderDir(sortType);       // "ASC" / "DESC"
+        const QString cmp = (dir == QLatin1String("ASC")) ? QStringLiteral(">") : QStringLiteral("<");
+
+        QString sql = QStringLiteral(
+            "SELECT name, path, suffix, size, modifiedTime, fileType, id FROM files ");
+        if (notIndexed)
+            sql += QStringLiteral("NOT INDEXED ");        // 必须紧跟表名
+        sql += QStringLiteral("WHERE ") + whereSql + QLatin1Char(' ');   // 兜底补空格
+
+        QList<QVariant> binds = whereBinds;
+        if (curKey.isValid()) {                           // 游标条件 = 「排在锚点之后」
+            sql += QStringLiteral("AND (") + keyExpr + QLatin1Char(' ') + cmp + QStringLiteral(" ? ")
+                + QStringLiteral("OR (") + keyExpr + QStringLiteral(" = ? AND id ") + cmp + QStringLiteral(" ?)) ");
+            binds << curKey << curKey << curId;
+        }
+
+        sql += QStringLiteral("ORDER BY ") + keyExpr + QLatin1Char(' ') + dir
+            + QStringLiteral(", id ") + dir
+            + QStringLiteral(" LIMIT ") + QString::number(limit + 1);
+
+        PagedResult r;
+        r.rows = runSearchSync(sql, binds);
+        r.hasMore = r.rows.size() > limit;
+        if (r.hasMore)
+            r.rows.removeLast();                          // 多要的那条只用来判 hasMore
+        if (!r.rows.isEmpty()) {
+            const FileInfo& last = r.rows.last();
+            r.lastKey = cursorKeyOf(last, sortType);      // 给下一页用
+            r.lastId = last.id;
+        }
+        else {
+            r.hasMore = false;
+        }
+        return r;
+    }
+
+    static QString prefixUpperBound(const QString& p)
+    {
+        if (p.isEmpty())
+            return p;
+        QString up = p;
+        up.back() = QChar(up.back().unicode() + 1);
+        return up;
+    }
+}
+
 FileDatabase::FileDatabase(QObject* parent)
 {
 }
@@ -28,8 +149,8 @@ bool FileDatabase::initDatabase()
     db.exec("PRAGMA synchronous = NORMAL;");      // 降低 fsync 频率，大幅提速（掉电最多丢最后一批）
     db.exec("PRAGMA temp_store = MEMORY;");       // 临时表/排序放内存
     db.exec("PRAGMA cache_size = -65536;");       // 页缓存 64MB，减少磁盘读
-    db.exec("PRAGMA wal_autocheckpoint = 100000;"); // 400MB 才自动 checkpoint
-    db.exec("PRAGMA journal_size_limit = 1073741824;"); // WAL 上限 1GB
+    db.exec("PRAGMA wal_autocheckpoint = 4000;"); // 4MB 才自动 checkpoint
+    db.exec("PRAGMA journal_size_limit = 67108864;"); // WAL 上限 64
 
     query = QSqlQuery(db);
 
@@ -81,200 +202,6 @@ bool FileDatabase::initDatabase()
     );
 
     return true;
-}
-
-void FileDatabase::searchFile(const QString& keyword, FileSearch type)
-{
-    switch (type) {
-    case FileSearch::Suffix:
-        searchFile_suffix(keyword);
-        break;
-    case FileSearch::File:
-        searchFile_filename(keyword);
-        break;
-    case FileSearch::Folder:
-        searchFile_folder(keyword);
-        break;
-    default:
-        break;
-    }
-}
-
-void FileDatabase::searchFolderContent(const QString& folderPath)
-{
-    QList<FileInfo> res;
-
-    if (folderPath.isEmpty()) {
-        emit sendFile_folderContent(res);
-        return;
-    }
-
-    QSqlQuery searchQuery(db);
-
-    // 直接子项：path = folderPath\xxx
-    // 转义 LIKE 通配符后：前缀 + '%' 匹配子项；排除前缀 + '%' + '\' + '%'
-    QString prefix = folderPath;
-    if (!prefix.endsWith('\\') && !prefix.endsWith('/'))
-        prefix += '\\';
-    QString escPrefix = prefix;
-    escPrefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
-    const QString childPattern = escPrefix + '%';
-    // 排除更深层：% 通配 + 字面反斜杠(\\转义对) + % 通配 —— 原写成 "\%" 是字面百分号，排除失效
-    const QString nestedPattern = escPrefix + "%\\\\%";
-
-    searchQuery.prepare(
-        R"(
-            SELECT name, path, suffix, size, modifiedTime, fileType
-            FROM files
-            WHERE path LIKE ? ESCAPE '\' AND path NOT LIKE ? ESCAPE '\'
-            ORDER BY modifiedTime DESC
-        )"
-    );
-    searchQuery.addBindValue(childPattern);
-    searchQuery.addBindValue(nestedPattern);
-
-    if (!searchQuery.exec())
-    {
-        qWarning() << searchQuery.lastError();
-        emit sendFile_folderContent(res);
-        return;
-    }
-
-    while (searchQuery.next()) {
-        FileInfo file;
-        file.name = searchQuery.value(0).toString();
-        file.path = searchQuery.value(1).toString();
-        file.suffix = searchQuery.value(2).toString();
-        file.size = searchQuery.value(3).toLongLong();
-        file.modifiedTime = QDateTime::fromSecsSinceEpoch(searchQuery.value(4).toLongLong());
-        file.isFolder = searchQuery.value(5).toInt() == 1;
-        res.append(file);
-    }
-
-    emit sendFile_folderContent(res);
-}
-
-void FileDatabase::searchFile_suffix(const QString& keyword)
-{
-    QList<FileInfo> res;
-    
-    QSqlQuery searchQuery(db);
-
-    searchQuery.prepare(
-        R"(
-            SELECT name, path, suffix, size, modifiedTime, fileType
-            FROM files
-            WHERE suffix = ?
-           )"
-    );
-    searchQuery.addBindValue(keyword.toLower());
-
-    if (!searchQuery.exec())
-    {
-        qWarning() << searchQuery.lastError();
-        
-        // 🐛 BUG: 搜索出错时不发射任何信号，UI 可能无响应
-        // ✅ 修复建议: 无论成功失败，都应发射信号，UI 需要响应
-        emit sendFile_suffix(QList<FileInfo>());
-        return;
-    }
-
-    while (searchQuery.next()) {
-        FileInfo file;
-
-        file.name = searchQuery.value(0).toString();
-        file.path = searchQuery.value(1).toString();
-        file.suffix = searchQuery.value(2).toString();
-        file.size = searchQuery.value(3).toLongLong();
-        file.modifiedTime = QDateTime::fromSecsSinceEpoch(searchQuery.value(4).toLongLong());
-        file.isFolder = searchQuery.value(5).toInt() == 1;
-
-        res.append(file);
-    }
-
-    emit sendFile_suffix(res);
-}
-
-void FileDatabase::searchFile_filename(const QString& keyword)
-{
-    QList<FileInfo> res;
-
-    QSqlQuery searchQuery(db);
-
-    searchQuery.prepare(
-        R"(
-            SELECT name, path, suffix, size, modifiedTime, fileType
-            FROM files
-            WHERE name LIKE ? ESCAPE '\' AND fileType = 0
-           )"
-    );
-    // 转义 LIKE 通配符，防止用户输入 % 或 _ 导致意外匹配
-    QString escaped = keyword;
-    escaped.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
-    searchQuery.addBindValue("%" + escaped + "%");
-
-    if (!searchQuery.exec())
-    {
-        qWarning() << searchQuery.lastError();
-        emit sendFile_filename(QList<FileInfo>());
-        return;
-    }
-
-    while (searchQuery.next()) {
-        FileInfo file;
-
-        file.name = searchQuery.value(0).toString();
-        file.path = searchQuery.value(1).toString();
-        file.suffix = searchQuery.value(2).toString();
-        file.size = searchQuery.value(3).toLongLong();
-        file.modifiedTime = QDateTime::fromSecsSinceEpoch(searchQuery.value(4).toLongLong());
-        file.isFolder = searchQuery.value(5).toInt() == 1;
-
-        res.append(file);
-    }
-
-    emit sendFile_filename(res);
-}
-
-void FileDatabase::searchFile_folder(const QString& keyword)
-{
-    QList<FileInfo> res;
-
-    QSqlQuery searchQuery(db);
-
-    searchQuery.prepare(
-        R"(
-            SELECT name, path, suffix, size, modifiedTime, fileType
-            FROM files
-            WHERE name LIKE ? ESCAPE '\' AND fileType = 1
-           )"
-    );
-    // 转义 LIKE 通配符，防止用户输入 % 或 _ 导致意外匹配
-    QString escaped = keyword;
-    escaped.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
-    searchQuery.addBindValue("%" + escaped + "%");
-
-    if (!searchQuery.exec())
-    {
-        qWarning() << searchQuery.lastError();
-        emit sendFile_folder(QList<FileInfo>());
-        return;
-    }
-
-    while (searchQuery.next()) {
-        FileInfo file;
-
-        file.name = searchQuery.value(0).toString();
-        file.path = searchQuery.value(1).toString();
-        file.suffix = searchQuery.value(2).toString();
-        file.size = searchQuery.value(3).toLongLong();
-        file.modifiedTime = QDateTime::fromSecsSinceEpoch(searchQuery.value(4).toLongLong());
-        file.isFolder = searchQuery.value(5).toInt() == 1;
-
-        res.append(file);
-    }
-
-    emit sendFile_folder(res);
 }
 
 void FileDatabase::insertFile(const QList<FileInfo>& info)
@@ -409,6 +336,7 @@ void FileDatabase::setInitialScanFinished()
     idxQuery.exec("CREATE INDEX IF NOT EXISTS idx_suffix ON files(suffix);");
     idxQuery.exec("CREATE INDEX IF NOT EXISTS idx_name ON files(name);");
     idxQuery.exec("CREATE INDEX IF NOT EXISTS idx_path ON files(path);");
+	idxQuery.exec("CREATE INDEX IF NOT EXISTS idx_modifiedTime ON files(modifiedTime);");
 
     QSqlQuery query(db);
 
@@ -550,60 +478,7 @@ void FileDatabase::renamePrefix(const QString& oldPrefix, const QString& newPref
     db.commit();
 }
 
-// 全量搜索：名字 LIKE，文件+文件夹全部返回（前端按模式过滤显示）
-void FileDatabase::searchAll(const QString& keyword)
-{
-    QList<FileInfo> res;
-
-    QSqlQuery q(db);
-    q.prepare(
-        R"(
-            SELECT name, path, suffix, size, modifiedTime, fileType
-            FROM files
-            WHERE name LIKE ?
-        )"
-    );
-
-    QString escaped = keyword;
-    escaped.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
-    q.addBindValue("%" + escaped + "%");
-
-    if (!q.exec())
-    {
-        emit sendFile_all(QList<FileInfo>());
-        return;
-    }
-
-    while (q.next())
-    {
-        FileInfo file;
-        file.name = q.value(0).toString();
-        file.path = q.value(1).toString();
-        file.suffix = q.value(2).toString();
-        file.size = q.value(3).toLongLong();
-        file.modifiedTime = QDateTime::fromSecsSinceEpoch(q.value(4).toLongLong());
-        file.isFolder = q.value(5).toInt() == 1;
-        res.append(file);
-    }
-
-    emit sendFile_all(res);
-}
-
 // 移动盘变化标记（运行时监视设置，下次启动据此决定是否重建）
-bool FileDatabase::getDirty(const QString& drive, bool* hasMark)
-{
-    QSqlQuery q(db);
-    q.prepare("SELECT value FROM metadata WHERE key = ?");
-    q.addBindValue("dirty_" + drive);
-    if (!q.exec() || !q.next())
-    {
-        if (hasMark) *hasMark = false;
-        return false;
-    }
-    if (hasMark) *hasMark = true;
-    return q.value(0).toString() == "1";
-}
-
 void FileDatabase::setDirty(const QString& drive, bool dirty)
 {
     QSqlQuery q(db);
@@ -615,16 +490,6 @@ void FileDatabase::setDirty(const QString& drive, bool dirty)
 }
 
 // 上次目录遍历时间戳（秒，用于移动盘增量判断）
-qint64 FileDatabase::getLastTraverseTime(const QString& drive)
-{
-    QSqlQuery q(db);
-    q.prepare("SELECT value FROM metadata WHERE key = ?");
-    q.addBindValue("lastTraverse_" + drive);
-    if (!q.exec() || !q.next())
-        return 0;
-    return q.value(0).toLongLong();
-}
-
 void FileDatabase::setLastTraverseTime(const QString& drive, qint64 ts)
 {
     QSqlQuery q(db);
@@ -635,72 +500,28 @@ void FileDatabase::setLastTraverseTime(const QString& drive, qint64 ts)
         qWarning() << "setLastTraverseTime 失败:" << q.lastError();
 }
 
-//同步搜索（独立只读连接：WAL 并发读，不排 dbThread 扫描队列
-namespace {
-QList<FileInfo> runSearchSync(const QString& sql, const QList<QVariant>& binds)
+PagedResult FileDatabase::searchFileSuffixSync(const QString& keyword, int sortType, const QVariant& curKey, qint64 curId, const QString& drivePrefix)
 {
-    QList<FileInfo> res;
-    const QString connName = QStringLiteral("search_%1").arg(
-        reinterpret_cast<quintptr>(QThread::currentThreadId()));
-    {
-        QSqlDatabase sdb = QSqlDatabase::addDatabase("QSQLITE", connName);
-        sdb.setDatabaseName(QCoreApplication::applicationDirPath() + "/fileindex.db");
-        sdb.setConnectOptions("QSQLITE_OPEN_READONLY");   // 只读：扫描写库可并发
-        if (sdb.open())
-        {
-            QSqlQuery q(sdb);
-            q.prepare(sql);
-            for (const QVariant& v : binds)
-                q.addBindValue(v);
-            if (q.exec())
-            {
-                while (q.next())
-                {
-                    FileInfo f;
-                    f.name = q.value(0).toString();
-                    f.path = q.value(1).toString();
-                    f.suffix = q.value(2).toString();
-                    f.size = q.value(3).toLongLong();
-                    f.modifiedTime = QDateTime::fromSecsSinceEpoch(q.value(4).toLongLong());
-                    f.isFolder = q.value(5).toInt() == 1;
-                    res.append(f);
-                }
-            }
-        }
-        sdb.close();
+    QString suf = keyword.toLower();
+    if (drivePrefix.isEmpty()) {
+        return searchPage(QStringLiteral("suffix = ?"),
+            { suf }, sortType, true, curKey, curId, kPageSize);
     }
-    QSqlDatabase::removeDatabase(connName);
-    return res;
-}
-QString escapeLike(const QString& kw)
-{
-    QString e = kw;
-    e.replace(QLatin1Char('\\'), QStringLiteral("\\\\"))
-     .replace(QLatin1Char('%'), QStringLiteral("\\%"))
-     .replace(QLatin1Char('_'), QStringLiteral("\\_"));
-    return e;
-}
+    return searchPage(QStringLiteral("suffix = ? AND path >= ? AND path < ? "),
+        { suf, drivePrefix, prefixUpperBound(drivePrefix) },
+        sortType, true, curKey, curId, kPageSize);
 }
 
-QList<FileInfo> FileDatabase::searchFileSuffixSync(const QString& keyword)
+PagedResult FileDatabase::searchFileFolderSync(const QString& keyword, int sortType, const QVariant& curKey, qint64 curId, const QString& drivePrefix)
 {
-    return runSearchSync(QStringLiteral(
-        "SELECT name, path, suffix, size, modifiedTime, fileType FROM files WHERE suffix = ?"),
-        { keyword.toLower() });
-}
-
-QList<FileInfo> FileDatabase::searchFileFilenameSync(const QString& keyword)
-{
-    return runSearchSync(QStringLiteral(
-        "SELECT name, path, suffix, size, modifiedTime, fileType FROM files WHERE name LIKE ? ESCAPE '\\' AND fileType = 0"),
-        { "%" + escapeLike(keyword) + "%" });
-}
-
-QList<FileInfo> FileDatabase::searchFileFolderSync(const QString& keyword)
-{
-    return runSearchSync(QStringLiteral(
-        "SELECT name, path, suffix, size, modifiedTime, fileType FROM files WHERE name LIKE ? ESCAPE '\\' AND fileType = 1"),
-        { "%" + escapeLike(keyword) + "%" });
+    const QString kw = QStringLiteral("%") + escapeLike(keyword) + QStringLiteral("%");
+    if (drivePrefix.isEmpty()) {
+        return searchPage(QStringLiteral("name LIKE ? ESCAPE '\\' AND fileType = 1"), { kw }, 
+            sortType, true, curKey, curId, kPageSize);
+    }
+    return searchPage(QStringLiteral("name LIKE ? ESCAPE '\\' AND fileType = 1 AND path >= ? AND path < ? "),
+        { kw, drivePrefix, prefixUpperBound(drivePrefix) },
+		sortType, true, curKey, curId, kPageSize);
 }
 
 QList<FileInfo> FileDatabase::searchFolderContentSync(const QString& folderPath)
@@ -709,14 +530,19 @@ QList<FileInfo> FileDatabase::searchFolderContentSync(const QString& folderPath)
     if (!prefix.endsWith(QLatin1Char('\\')))
         prefix += QLatin1Char('\\');
     return runSearchSync(QStringLiteral(
-        "SELECT name, path, suffix, size, modifiedTime, fileType FROM files WHERE path LIKE ? ESCAPE '\\'"),
-        { escapeLike(prefix) + "%" });
+        "SELECT name, path, suffix, size, modifiedTime, fileType FROM files "
+        "WHERE path >= ? AND path < ? AND path NOT LIKE ? ESCAPE '\\'"),
+        { prefix, prefixUpperBound(prefix), escapeLike(prefix) + QStringLiteral("%\\\\%") });
 }
 
-QList<FileInfo> FileDatabase::searchAllSync(const QString& keyword)
+PagedResult FileDatabase::searchAllSync(const QString& keyword, int sortType, const QVariant& curKey, qint64 curId, const QString& drivePrefix)
 {
-    return runSearchSync(QStringLiteral(
-        "SELECT name, path, suffix, size, modifiedTime, fileType FROM files WHERE name LIKE ? ESCAPE '\\'"),
-        { "%" + escapeLike(keyword) + "%" });
+    const QString kw = QStringLiteral("%") + escapeLike(keyword) + QStringLiteral("%");
+    if (drivePrefix.isEmpty()) {
+        return searchPage(QStringLiteral("name LIKE ? ESCAPE '\\' "),
+            { kw }, sortType, true, curKey, curId, kPageSize);
+    }
+    return searchPage(QStringLiteral("name LIKE ? ESCAPE '\\' AND path >= ? AND path < ? "),
+        { kw, drivePrefix, prefixUpperBound(drivePrefix) },
+        sortType, true, curKey, curId, kPageSize);
 }
-

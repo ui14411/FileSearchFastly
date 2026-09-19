@@ -31,10 +31,10 @@ ApplicationWindow {
     property int loadedCount: 0
     property string scanStatus: ""
     property string currentPath: ""   // 当前所在目录（文件夹模式导航，空=不在目录内）
-
-    // 进度条
-    function beginLoad() { loadingCount++ }
-    function endLoad() { if (loadingCount > 0) loadingCount-- }
+    property string emptyHint: ""     // 空态提示（未找到 / 请输入关键词 / 此目录为空）
+    property bool hasSearched: false  // 是否已执行过搜索（区分"还没搜"和"搜了没结果"）
+    property bool hasMoreAll: false   // 全量模式下后端还有下一页（由 searchResultAll 的 hasMore 驱动）
+    property bool sortBoxSync: false  // 程序内同步排序下拉时置真，避免多打一次查询
 
     // 启动时获取盘符列表
     Component.onCompleted: {
@@ -46,52 +46,35 @@ ApplicationWindow {
     Connections {
         target: fileInteract
 
-        // 接收按后缀搜索的结果
-        function onSearchResultBySuffix(results) {
-            console.log("按后缀搜索完成，结果数:", results.length)
-            window.lastResults = results
-            window.applyModeFilter()   // 盘符过滤 + 后缀精确二次过滤
-        }
-
-        // 接收按文件名搜索的结果
-        function onSearchResultByFile(results) {
-            console.log("按文件名搜索完成，结果数:", results.length)
-            window.requestShow(results)
-        }
-
-        // 接收按文件夹名搜索的结果：列出匹配文件夹，单击进入（cd），不再自动进第一个
-        function onSearchResultByFolder(results) {
-            console.log("匹配文件夹数:", results.length)
-            window.currentPath = ""   // 搜索时重置路径（不在目录内）
-            window.requestShow(results)
-        }
-
         // 接收文件夹内容（列目录）结果
         function onSearchResultByFolderContent(results) {
             console.log("文件夹内容，条目数:", results.length)
-            window.requestShow(results)
+            window.requestShow(results, "此目录为空")
         }
 
-        // 接收全量搜索结果（文件+文件夹）：存结果 → 按当前模式过滤显示
-        function onSearchResultAll(results) {
-            console.log("全量搜索完成，结果数:", results.length)
+        // 接收全量搜索结果（文件+文件夹）：过滤与排序已由 SQL 完成 → 直接填，不再走前端排序
+        // 第二页起 append=true，往现有列表尾部追加，不能重建
+        function onSearchResultAll(results, hasMore, append) {
+            console.log("全量搜索完成，本页:", results.length, "还有更多:", hasMore, "追加:", append)
+            window.hasMoreAll = hasMore
+            if (append) {
+                if (results.length === 0)
+                    return
+                // 就地 push 不触发属性变更通知，底部计数绑定不会刷新 → 整体赋值新数组
+                window.displayResults = window.displayResults.concat(results)
+                window.lastResults = window.displayResults
+                window.loadMore()          // 只把新追加的这批喂进 model
+                Qt.callLater(window.ensureViewportFilled)
+                return
+            }
             window.lastResults = results
-            window.applyModeFilter()
+            window.requestShow(results, undefined, true)
         }
 
         // 扫描状态栏
         function onScanStatusChanged(text) {
             console.warn("QML 收到扫描状态:", text)   // 诊断
             window.scanStatus = text
-        }
-
-        // 异步排序完成（线程池）：先消进度计数（每个 requestSort 必有一次 ready），
-        // seq 对不上 = 过期结果，丢弃
-        function onSortResultReady(sorted, seq) {
-            window.endLoad()
-            if (seq !== window.searchTick)
-                return
-            window.fillModel(sorted)
         }
 
         // 搜索完成信号
@@ -157,13 +140,16 @@ ApplicationWindow {
                     model: ["文件", "文件夹", "文件后缀"]
                     onCurrentIndexChanged: {
                         window.searchType = currentIndex
+                        window.currentPath = ""   // 换模式即离开目录导航，回到搜索结果
                         // 文件夹模式默认按最后修改时间排序
                         if (currentIndex === 1) {
                             window.sortType = 5
+                            window.sortBoxSync = true
                             sortBox.currentIndex = 5
+                            window.sortBoxSync = false
                         }
-                        // 切换模式 = 前端过滤当前结果
-                        window.applyModeFilter()
+                        // 换模式 = 换一条查询，不再在前端过滤已加载的那批行
+                        window.runSearch()
                     }
                 }
 
@@ -202,15 +188,14 @@ ApplicationWindow {
                     onClicked: {
                         var kw = searchEdit.text.trim()
                         window.searchKeyword = kw
-                        if (kw === "")
+                        if (kw === "") {
+                            window.showEmpty("请输入搜索关键词")
                             return
-                        // 按模式分派：后缀走索引查询；文件夹走文件夹匹配；默认全量
-                        if (window.searchType === 2)
-                            fileInteract.searchBySuffix(kw)
-                        else if (window.searchType === 1)
-                            fileInteract.searchByFolder(kw)
-                        else
-                            fileInteract.searchAll(kw)
+                        }
+                        // 标记为已搜索：靠这个标志区分"还没搜过"和"搜了没结果"
+                        window.hasSearched = true
+                        window.currentPath = ""   // 新搜索不在任何目录里
+                        window.runSearch()
                     }
                 }
             }
@@ -230,23 +215,22 @@ ApplicationWindow {
                 elide: Text.ElideMiddle
             }
 
-            // 返回上级按钮（目录导航：进入目录后显示，回父目录）
+            // 返回上级按钮（目录导航：进入目录后显示）
+            // 回到的是 UI 的上一层 = 搜索结果页，不是文件系统的父目录。
+            // 目录里只可能从搜索结果点进来，所以上一层恒为搜索结果：
+            // 清空 currentPath 后重跑当前模式的查询即可（runSearch 按 searchType 分派，
+            // 三种模式都回到各自的结果页，同时顺手复位后端游标 → 第 1 页）
             Button {
                 id: backBtn
-                text: "⬆ 返回上级"
+                text: "⬅ 返回搜索结果"
                 visible: window.currentPath !== ""
                 onClicked: {
-                    var p = window.currentPath
-                    var idx = p.lastIndexOf("\\")
-                    if (idx > 2) {
-                        // 非盘根：回父目录
-                        window.currentPath = p.substring(0, idx)
-                        fileInteract.searchByFolderContent(window.currentPath)
-                    } else {
-                        // 盘根：回到搜索（重新列出匹配文件夹）
-                        window.currentPath = ""
-                        fileInteract.searchByFolder(window.searchKeyword)
-                    }
+                    window.currentPath = ""
+                    // 关键词被清空过就别重查了（runSearch 会直接 return，标题会和列表对不上）
+                    if (window.searchKeyword !== "")
+                        window.runSearch()
+                    else
+                        window.showEmpty("请输入搜索关键词")
                 }
             }
 
@@ -274,7 +258,7 @@ ApplicationWindow {
                             cursorShape: Qt.PointingHandCursor
                             onClicked: {
                                 window.currentDrive = modelData
-                                window.applyModeFilter()
+                                window.runSearch()   // 换盘符 = 重查第 1 页（原来只在前端过滤已加载的那批行）
                             }
                         }
                     }
@@ -291,9 +275,11 @@ ApplicationWindow {
                 Layout.preferredWidth: 150
                 model: ["名称 ↑", "名称 ↓", "大小 ↑", "大小 ↓", "修改时间 ↑", "修改时间 ↓"]
                 currentIndex: 5   // 默认"修改时间 ↓"（与 window.sortType 初始值一致）
+                // 排序下推在 SQL 的 ORDER BY 里：换档位要重查第 1 页才生效（重查同时复位游标，翻页照常）
                 onCurrentIndexChanged: {
                     window.sortType = currentIndex
-                    window.reapplySort()   // 即时重排当前结果
+                    if (!window.sortBoxSync)
+                        window.runSearch()
                 }
             }
         }
@@ -322,29 +308,48 @@ ApplicationWindow {
                         anchors.leftMargin: 15
                         anchors.rightMargin: 15
 
-                        Label {
-                            text: "名称"; font.bold: true; color: "#1f3347"; Layout.preferredWidth: 300
+                        // 名称 / 大小 / 修改时间 可点击排序（点同列翻方向）
+                        Item {
+                            Layout.preferredWidth: 300
+                            Layout.fillHeight: true
+                            Label {
+                                anchors.fill: parent
+                                text: "名称"; font.bold: true; color: "#1f3347"
+                                verticalAlignment: Text.AlignVCenter
+                            }
                             MouseArea {
                                 anchors.fill: parent
                                 cursorShape: Qt.PointingHandCursor
-                                onClicked: window.cycleSort(0)
+                                onClicked: window.toggleSort(0)
                             }
                         }
                         Label { text: "类型"; font.bold: true; color: "#1f3347"; Layout.preferredWidth: 100 }
-                        Label {
-                            text: "大小"; font.bold: true; color: "#1f3347"; Layout.preferredWidth: 120
+                        Item {
+                            Layout.preferredWidth: 120
+                            Layout.fillHeight: true
+                            Label {
+                                anchors.fill: parent
+                                text: "大小"; font.bold: true; color: "#1f3347"
+                                verticalAlignment: Text.AlignVCenter
+                            }
                             MouseArea {
                                 anchors.fill: parent
                                 cursorShape: Qt.PointingHandCursor
-                                onClicked: window.cycleSort(1)
+                                onClicked: window.toggleSort(1)
                             }
                         }
-                        Label {
-                            text: "修改时间"; font.bold: true; color: "#1f3347"; Layout.preferredWidth: 180
+                        Item {
+                            Layout.preferredWidth: 180
+                            Layout.fillHeight: true
+                            Label {
+                                anchors.fill: parent
+                                text: "修改时间"; font.bold: true; color: "#1f3347"
+                                verticalAlignment: Text.AlignVCenter
+                            }
                             MouseArea {
                                 anchors.fill: parent
                                 cursorShape: Qt.PointingHandCursor
-                                onClicked: window.cycleSort(2)
+                                onClicked: window.toggleSort(2)
                             }
                         }
                         Label { text: "路径"; font.bold: true; color: "#1f3347"; Layout.fillWidth: true }
@@ -536,6 +541,18 @@ ApplicationWindow {
                     }
                 }
             }
+
+            // 空态提示：未找到 / 请输入关键词 / 此目录为空
+            Text {
+                anchors.centerIn: parent
+                width: parent.width - 80
+                horizontalAlignment: Text.AlignHCenter
+                wrapMode: Text.Wrap
+                visible: window.emptyHint !== "" && window.loadingCount === 0
+                text: window.emptyHint
+                color: "#8aa0b8"
+                font.pixelSize: 15
+            }
         }
 
         // 底部状态
@@ -553,37 +570,71 @@ ApplicationWindow {
         }
     }
 
-    // 排序与填充
-    function applyModeFilter() {
-        if (!lastResults || lastResults.length === 0)
-            return
-        var drivePrefix = window.currentDrive === "全部" ? "" : window.currentDrive + ":\\"
-        var filtered = []
-        for (var i = 0; i < lastResults.length; i++) {
-            var it = lastResults[i]
-            var p = "" + it.path
-            if (drivePrefix !== "" && p.toUpperCase().indexOf(drivePrefix) !== 0)
-                continue 
-            var isFolder = ("" + it.isFolder) === "true"
-            var ok = false
-            switch (window.searchType) {
-            case 0:  ok = true; break                                 
-            case 1:  ok = isFolder; break                                
-            default: ok = !isFolder && ("" + (it.suffix || "")).toLowerCase() === window.searchKeyword.toLowerCase(); break  // 后缀：精确匹配（忽略大小写）
-            }
-            if (ok)
-                filtered.push(it)
-        }
-        console.log("模式过滤: " + window.searchType + " 盘=" + window.currentDrive
-                    + " → " + filtered.length + " / " + lastResults.length)
-        requestShow(filtered)
+    // 表头点击排序：同列再点翻方向，换列默认降序。
+    // col：0=名称 1=大小 2=修改时间（与 sortType/2 的后端列号一致）
+    function toggleSort(col) {
+        if (Math.floor(window.sortType / 2) === col)
+            window.sortType = col * 2 + (1 - window.sortType % 2)
+        else
+            window.sortType = col * 2 + 1
+        window.sortBoxSync = true          // 同步下拉框但不触发它自己那次重查
+        sortBox.currentIndex = window.sortType
+        window.sortBoxSync = false
+        window.runSearch()
     }
 
-    function requestShow(results) {
-        // 新结果
+    // 用当前的 关键词 / 模式 / 排序档位 / 盘符 重新发一次查询。
+    // 排序与过滤已下推 SQL，所以让设置生效 = 重查第 1 页；重发查询同时会把后端游标复位，
+    // 因此换排序、切盘符、切模式之后都能继续正常往下翻页。
+    function runSearch() {
+        if (window.searchKeyword === "")
+            return
+        if (window.searchType === 2)
+            fileInteract.searchBySuffix(window.searchKeyword,window.sortType, drivePrefix)
+        else if (window.searchType === 1) {
+            if (window.currentPath !== "")
+                fileInteract.searchByFolderContent(window.currentPath)   // 在目录里 → 重列当前目录
+            else
+                fileInteract.searchByFolder(window.searchKeyword, window.sortType, drivePrefix)
+        } else {
+            var drivePrefix = window.currentDrive === "全部" ? "" : window.currentDrive + ":\\"
+            fileInteract.searchAll(window.searchKeyword, window.sortType, drivePrefix)
+        }
+    }
+
+    // 所有模式的结果都从这里进（文件名 / 文件夹 / 后缀 / 列目录）→ 空判断只写一处
+    // 排序已全部交给 SQL 的 ORDER BY，两条分支都直接填充，前端不再重排
+    // sorted = true：来自分页链路（后端驱动 hasMoreAll，不能清）；否则是前端过滤/裁剪过的视图
+    function requestShow(results, emptyMsg, sorted) {
+        if (!results || results.length === 0) {
+            showEmpty(emptyMsg || (window.searchKeyword !== ""
+                ? "未找到与 \"" + window.searchKeyword + "\" 匹配的文件"
+                : "未找到文件"))
+            return
+        }
+        window.hasSearched = true
+        window.emptyHint = ""   // 有结果 → 清掉提示
+        if (sorted) {
+            searchTick++        // 作废在途的旧请求
+            fillModel(results)
+            return
+        }
+        window.hasMoreAll = false   // 走前端过滤的视图不分页（列表已被裁剪，后端游标对不上）
         searchTick++
-        beginLoad()
-        fileInteract.requestSort(results, window.sortType, searchTick)
+        fillModel(results)
+    }
+
+    // 空态：清空列表 + 显示提示。
+    // 必须推进 searchTick：上一次搜索还在途的排序结果回来时 seq 对不上会被丢弃，
+    // 否则它会把刚清空的列表重新填满、盖住提示。
+    function showEmpty(msg) {
+        window.hasSearched = true
+        window.emptyHint = msg
+        displayResults = []
+        fileModel.clear()
+        loadedCount = 0
+        hasMoreAll = false   // 列表都清空了，别让 loadMore 再去要下一页
+        searchTick++
     }
 
     // 结果
@@ -596,8 +647,11 @@ ApplicationWindow {
     }
 
     function loadMore() {
-        if (loadedCount >= displayResults.length)
+        if (loadedCount >= displayResults.length) {
+            if (window.hasMoreAll)
+                fileInteract.loadNextPage()   // 本页切完了，后端还有 → 要下一页
             return
+        }
         var end = Math.min(loadedCount + pageSize, displayResults.length)
         for (var i = loadedCount; i < end; i++) {
             var it = displayResults[i]
@@ -620,23 +674,6 @@ ApplicationWindow {
             loadMore()
             Qt.callLater(ensureViewportFilled) 
         }
-    }
-
-    function reapplySort() {
-        if (lastResults.length > 0)
-            applyModeFilter()
-    }
-
-    function cycleSort(col) {
-        var base = (col === 0) ? 0 : (col === 1) ? 2 : 4
-        if (window.sortType === base)
-            window.sortType = base + 1
-        else if (window.sortType === base + 1)
-            window.sortType = base
-        else
-            window.sortType = base
-        sortBox.currentIndex = window.sortType
-        reapplySort()
     }
 
     //工具函数 

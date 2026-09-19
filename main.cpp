@@ -35,7 +35,7 @@ int main(int argc, char *argv[])
 #endif
     QGuiApplication app(argc, argv);
 
-    // 日志文件放 exe 同级目录（发布后跟随程序，不依赖 F 盘固定路径）
+    // 日志文件放 exe 同级目录
     g_logFile = new QFile(QCoreApplication::applicationDirPath() + "/scan.log");
     g_logFile->open(QIODevice::Append | QIODevice::Text);
     qInstallMessageHandler(logToFile);
@@ -43,10 +43,8 @@ int main(int argc, char *argv[])
 
     FileInteract fileInteract;
 
-    fileInteract.init();
+    QQmlApplicationEngine engine;  
 
-    QQmlApplicationEngine engine;    
-    
     engine.rootContext()->setContextProperty(
         "fileInteract",
         &fileInteract
@@ -55,6 +53,8 @@ int main(int argc, char *argv[])
     engine.load(QUrl(QStringLiteral("qrc:/qt/qml/FileSearchFastly/main.qml")));
     if (engine.rootObjects().isEmpty())
         return -1;
+
+    fileInteract.init();
 
     qWarning() << "[MAIN] 事件循环开始";
     const int rc = app.exec();

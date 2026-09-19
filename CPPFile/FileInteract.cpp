@@ -47,22 +47,9 @@ bool FileInteract::init()
 
     m_scanner->scannerFile();   // 内部创建 dbThread + 队列初始化 + 启动扫描
 
-    connect(m_database, &FileDatabase::sendFile_suffix,
-        this, &FileInteract::onDatabaseResult_suffix);
-
-    connect(m_database, &FileDatabase::sendFile_filename,
-        this, &FileInteract::onDatabaseResult_filename);
-
-    connect(m_database, &FileDatabase::sendFile_folder,
-        this, &FileInteract::onDatabaseResult_folder);
-
-    connect(m_database, &FileDatabase::sendFile_folderContent,
-        this, &FileInteract::onDatabaseResult_folderContent);
-
-    connect(m_database, &FileDatabase::sendFile_all,
-        this, &FileInteract::onDatabaseResult_all);
-
-    // 搜索已改独立线程+独立只读连接（不排 dbThread 队列）——旧队列连接废弃
+    // 搜索走独立线程+独立只读连接（不排 dbThread 队列）
+    connect(this, &FileInteract::pagedResultReady,
+		this, &FileInteract::onPagedResult_all);
 
     // qDebug() << "FileInteract: 初始化成功";  // 调试用
     qWarning() << "[权限] 是否管理员提权:" << (isElevated() ? "是" : "否");
@@ -80,20 +67,42 @@ void FileInteract::showInExplorer(const QString& path)
         qWarning() << "打开资源管理器失败:" << path;
 }
 
-// 搜索函数，后缀，文件名，文件夹，
-void FileInteract::searchBySuffix(const QString& suffix)
+// 搜索函数，后缀，文件夹，所有文件，处理文件不存在
+void FileInteract::searchBySuffix(const QString& keyword, int sortType, const QString& drivePrefix)
 {
     if (!m_database) {
         emit searchFinished(0, "数据库未初始化");
         return;
     }
-    // 独立线程 + 独立只读连接：扫描中也能秒搜（不排 dbThread 队列）
-    std::thread([this, suffix]() {
-        emit searchResultBySuffix(convertToQVariantList(m_database->searchFileSuffixSync(suffix)));
-    }).detach();
+    m_keyWord = keyword;
+    m_sortType = sortType;
+    m_drivePrefix = drivePrefix;
+    const int thisSeq = m_seq.fetchAndAddOrdered(1) + 1;
+    m_curKey = QVariant();
+    QString kw = m_keyWord;
+    QString dp = m_drivePrefix;
+    QVariant curKey = m_curKey;
+    qint64 curId = m_curId;
+    int st = m_sortType;
+    m_hasMore = false;
+    static QThreadPool* pool = [] {
+        auto* p = new QThreadPool();
+        p->setMaxThreadCount(1);
+        return p;
+        }();
+
+    pool->start([this,kw,st,dp,curKey,curId, thisSeq]() {
+        if (m_seq != thisSeq)
+            return;
+        PagedResult res = m_database->searchFileSuffixSync(kw, st, curKey, curId, dp);
+		QVariantList rows = convertToQVariantList(res.rows);
+        if (m_seq != thisSeq)
+            return;
+        emit pagedResultReady(thisSeq, rows, res.hasMore, res.lastKey, res.lastId, false);
+        });
 }
 
-void FileInteract::searchByFile(const QString& keyword)
+void FileInteract::searchByFolder(const QString& keyword, int sortType, const QString& drivePrefix)
 {
     if (!m_database) {
         emit searchFinished(0, "数据库未初始化");
@@ -103,40 +112,114 @@ void FileInteract::searchByFile(const QString& keyword)
         emit searchFinished(0, "搜索关键词不能为空");
         return;
     }
-    std::thread([this, keyword]() {
-        emit searchResultByFile(convertToQVariantList(m_database->searchFileFilenameSync(keyword)));
-    }).detach();
+    m_keyWord = keyword;
+    m_sortType = sortType;
+    m_drivePrefix = drivePrefix;
+    const int thisSeq = m_seq.fetchAndAddOrdered(1) + 1;
+    m_curKey = QVariant();
+    QString kw = m_keyWord;
+    QString dp = m_drivePrefix;
+    QVariant curKey = m_curKey;
+    qint64 curId = m_curId;
+    int st = m_sortType;
+    m_hasMore = false;
+
+    static QThreadPool* pool = [] {
+        auto* p = new QThreadPool();
+        p->setMaxThreadCount(1);
+        return p;
+        }();
+
+    pool->start([this, kw,dp,curKey,curId,st, thisSeq]() {
+        if (m_seq != thisSeq)
+            return;
+        PagedResult res = m_database->searchFileFolderSync(kw, st, curKey, curId, dp);
+		QVariantList rows = convertToQVariantList(res.rows);
+        if (m_seq != thisSeq)
+            return;
+		emit pagedResultReady(thisSeq, rows, res.hasMore, res.lastKey, res.lastId, false);
+        });
 }
 
-void FileInteract::searchByFolder(const QString& keyword)
+void FileInteract::searchAll(const QString& keyword, int sortType, const QString& drivePrefix)
 {
     if (!m_database) {
         emit searchFinished(0, "数据库未初始化");
         return;
     }
-    if (keyword.isEmpty()) {
+    m_keyWord = keyword;
+    m_sortType = sortType;
+    m_drivePrefix = drivePrefix;
+    if (m_keyWord.isEmpty()) {
         emit searchFinished(0, "搜索关键词不能为空");
         return;
     }
-    std::thread([this, keyword]() {
-        emit searchResultByFolder(convertToQVariantList(m_database->searchFileFolderSync(keyword)));
-    }).detach();
+    const int thisSeq = m_seq.fetchAndAddOrdered(1) + 1;
+	m_curKey = QVariant();
+	QString kw = m_keyWord;
+	QString dp = m_drivePrefix;
+	QVariant curKey = m_curKey;
+	qint64 curId = m_curId;
+	int st = m_sortType;
+    m_hasMore = false;
+
+    static QThreadPool* pool = [] {
+        auto* p = new QThreadPool();
+        p->setMaxThreadCount(1);
+        return p;
+        }();
+
+    pool->start([this,thisSeq,kw,dp,curKey,st,curId]() {
+        if (m_seq != thisSeq)
+            return;
+        PagedResult res = m_database->searchAllSync(kw,st,curKey,curId, dp);
+        QVariantList rows = convertToQVariantList(res.rows);
+        if (m_seq != thisSeq)
+            return;
+        emit pagedResultReady(thisSeq,rows,res.hasMore,res.lastKey,res.lastId, false);
+        });
 }
 
-void FileInteract::searchAll(const QString& keyword)
+ void FileInteract::loadNextPage()
+ {
+     if (!m_hasMore || m_loading || !m_database)
+         return;
+	 m_loading = true;
+	 const int thisSeq = m_seq.loadAcquire();
+
+     const QString kw = m_keyWord;
+     const int st = m_sortType;
+     const QString dp = m_drivePrefix;
+     const QVariant ck = m_curKey;
+     const qint64 cid = m_curId;
+
+     static QThreadPool* pool = [] {
+         auto* p = new QThreadPool();
+         p->setMaxThreadCount(1);
+         return p;
+         }();
+
+     pool->start([this, thisSeq, kw, st, dp, ck, cid]() {
+         if (m_seq != thisSeq)
+             return;
+         PagedResult res = m_database->searchAllSync(kw, st, ck, cid, dp);
+         QVariantList rows = convertToQVariantList(res.rows);
+         if (m_seq != thisSeq)
+             return;
+         emit pagedResultReady(thisSeq, rows, res.hasMore, res.lastKey, res.lastId, true);   // true = 追加
+         });
+ }
+
+void FileInteract::onPagedResult_all(int seq, const QVariantList& rows, bool hasMore, const QVariant& lastKey, qint64 lastId,bool append)
 {
-    if (!m_database) {
-        emit searchFinished(0, "数据库未初始化");
-        return;
-    }
-    if (keyword.isEmpty()) {
-        emit searchFinished(0, "搜索关键词不能为空");
-        return;
-    }
-    std::thread([this, keyword]() {
-        emit searchResultAll(convertToQVariantList(m_database->searchAllSync(keyword)));
-    }).detach();
+    if (seq != m_seq.loadAcquire()) return;
+    m_curKey = lastKey;          
+    m_curId = lastId;
+    m_hasMore = hasMore;
+    m_loading = false;               
+    emit searchResultAll(rows, hasMore,append);
 }
+
 
 //输出目录中的内容
 void FileInteract::searchByFolderContent(const QString& folderPath)
@@ -146,9 +229,23 @@ void FileInteract::searchByFolderContent(const QString& folderPath)
         return;
     }
     // 独立线程 + 独立只读连接：扫描中也能秒搜（不排 dbThread 队列）
-    std::thread([this, folderPath]() {
-        emit searchResultByFolderContent(convertToQVariantList(m_database->searchFolderContentSync(folderPath)));
-    }).detach();
+
+    const int thisSeq = m_seq.fetchAndAddOrdered(1) + 1;
+    
+    static QThreadPool* pool = [] {
+        auto* p = new QThreadPool();
+        p->setMaxThreadCount(1);
+        return p;
+        }();
+
+    pool->start([this,folderPath,thisSeq]() {
+        if (m_seq != thisSeq)
+            return;
+        QVariantList res = convertToQVariantList(m_database->searchFolderContentSync(folderPath));
+        if (m_seq != thisSeq)
+            return;
+        emit searchResultByFolderContent(res);
+        });
 }
 
 QStringList FileInteract::getDrives() const
@@ -162,31 +259,6 @@ QStringList FileInteract::getDrives() const
             list << letter;
     }
     return list;
-}
-
-QString FileInteract::formatSize(qint64 bytes)
-{
-    if (bytes < 0) return "未知";
-    if (bytes < 1024) {
-        return QString::number(bytes) + " B";
-    }
-    else if (bytes < 1024 * 1024) {
-        return QString::number(bytes / 1024.0, 'f', 2) + " KB";
-    }
-    else if (bytes < 1024 * 1024 * 1024) {
-        return QString::number(bytes / 1024.0 / 1024.0, 'f', 2) + " MB";
-    }
-    else {
-        return QString::number(bytes / 1024.0 / 1024.0 / 1024.0, 'f', 2) + " GB";
-    }
-}
-
-QString FileInteract::formatDateTime(const QDateTime& dateTime)
-{
-    if (!dateTime.isValid()) {
-        return "未知";
-    }
-    return dateTime.toString("yyyy-MM-dd hh:mm:ss");
 }
 
 QVariantList FileInteract::convertToQVariantList(const QList<FileInfo>& files)
@@ -204,102 +276,6 @@ QVariantList FileInteract::convertToQVariantList(const QList<FileInfo>& files)
         results.append(map);
     }
     return results;
-}
-
-// 排序（在线程池执行，不卡 UI）：sortType 0-5 = 名称↑↓ / 大小↑↓ / 修改时间↑↓
-// modifiedTime 是 "yyyy-MM-dd hh:mm:ss" 字符串，字典序 == 时间序
-static QVariantList sortResultsImpl(const QVariantList& results, int sortType)
-{
-    QVector<QVariantMap> maps;
-    maps.reserve(results.size());
-    for (const QVariant& v : results)
-        maps.append(v.toMap());
-
-    auto byName = [](const QVariantMap& a, const QVariantMap& b) {
-        return a.value("name").toString().localeAwareCompare(b.value("name").toString());
-    };
-    auto bySize = [](const QVariantMap& a, const QVariantMap& b) {
-        const qint64 sa = a.value("size").toLongLong(), sb = b.value("size").toLongLong();
-        return sa < sb ? -1 : (sa > sb ? 1 : 0);
-    };
-    auto byTime = [](const QVariantMap& a, const QVariantMap& b) {
-        return a.value("modifiedTime").toString().compare(b.value("modifiedTime").toString());
-    };
-
-    auto comparator = [&](const QVariantMap& a, const QVariantMap& b) {
-        int r = 0;
-        switch (sortType) {
-        case 0: r = byName(a, b); break;
-        case 1: r = byName(b, a); break;
-        case 2: r = bySize(a, b); break;
-        case 3: r = bySize(b, a); break;
-        case 4: r = byTime(a, b); break;
-        default: r = byTime(b, a); break;   // 5: 修改时间↓
-        }
-        return r < 0;
-    };
-    std::sort(maps.begin(), maps.end(), comparator);
-
-    QVariantList out;
-    out.reserve(maps.size());
-    for (QVariantMap& m : maps)
-        out.append(m);
-    return out;
-}
-
-void FileInteract::requestSort(const QVariantList& results, int sortType, int seq)
-{
-    // 线程池排序；完成信号跨线程队列回 QML（seq 用于丢弃过期结果）
-    QThreadPool::globalInstance()->start([this, results, sortType, seq]() {
-        const QVariantList sorted = sortResultsImpl(results, sortType);
-        emit sortResultReady(sorted, seq);
-    });
-}
-
-void FileInteract::onDatabaseResult_suffix(const QList<FileInfo>& files)
-{
-    // 转换放线程池：36000 条构建 QVariantMap 在主线程会卡 UI
-    QThreadPool::globalInstance()->start([this, files]() {
-        const QVariantList results = convertToQVariantList(files);
-        emit searchResultBySuffix(results);
-        emit searchFinished(files.size());
-    });
-}
-
-void FileInteract::onDatabaseResult_filename(const QList<FileInfo>& files)
-{
-    QThreadPool::globalInstance()->start([this, files]() {
-        const QVariantList results = convertToQVariantList(files);
-        emit searchResultByFile(results);
-        emit searchFinished(files.size());
-    });
-}
-
-void FileInteract::onDatabaseResult_folder(const QList<FileInfo>& files)
-{
-    QThreadPool::globalInstance()->start([this, files]() {
-        const QVariantList results = convertToQVariantList(files);
-        emit searchResultByFolder(results);
-        emit searchFinished(files.size());
-    });
-}
-
-void FileInteract::onDatabaseResult_folderContent(const QList<FileInfo>& files)
-{
-    QThreadPool::globalInstance()->start([this, files]() {
-        const QVariantList results = convertToQVariantList(files);
-        emit searchResultByFolderContent(results);
-        emit searchFinished(files.size());
-    });
-}
-
-void FileInteract::onDatabaseResult_all(const QList<FileInfo>& files)
-{
-    QThreadPool::globalInstance()->start([this, files]() {
-        const QVariantList results = convertToQVariantList(files);
-        emit searchResultAll(results);
-        emit searchFinished(files.size());
-    });
 }
 
 // 扫描状态：按盘 USN 支持显示不同文本

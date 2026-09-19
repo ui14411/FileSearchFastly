@@ -86,7 +86,6 @@ public:
 
 public:
     void scannerFile();
-    void sortFile(SortType key, QList<FileInfo>& filelist);
 
 signals:
     void scanDriveStarted(const QString& letter, bool usnSupported);   // 每盘开始扫描

@@ -23,7 +23,7 @@ QDateTime FILETIME_to_QDateTime(const FILETIME& ft)
         static_cast<qint64>(t / 10000) - 11644473600000LL);
 }
 
-// 构造函数已在头文件内联（带背压计数参数）
+// 构造函数已在头文件内联
 
 // 前向声明：解析函数定义在下方，resolveDirPath 先使用
 static bool parseFileNameAttr(const BYTE* rec, DWORD recLen,
