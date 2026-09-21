@@ -589,6 +589,8 @@ ApplicationWindow {
     function runSearch() {
         if (window.searchKeyword === "")
             return
+        // 必须在使用前声明：原先写在 else 分支里，var 提升后前两个模式拿到 undefined，盘符过滤恒为空
+        var drivePrefix = window.currentDrive === "全部" ? "" : window.currentDrive + ":\\"
         if (window.searchType === 2)
             fileInteract.searchBySuffix(window.searchKeyword,window.sortType, drivePrefix)
         else if (window.searchType === 1) {
@@ -597,7 +599,6 @@ ApplicationWindow {
             else
                 fileInteract.searchByFolder(window.searchKeyword, window.sortType, drivePrefix)
         } else {
-            var drivePrefix = window.currentDrive === "全部" ? "" : window.currentDrive + ":\\"
             fileInteract.searchAll(window.searchKeyword, window.sortType, drivePrefix)
         }
     }

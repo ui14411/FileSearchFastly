@@ -12,9 +12,9 @@
 #include "HeaderFile/FileDatabase.h"
 #include "HeaderFile/FileInteract.h"
 
-// 诊断（2026-08）：所有 Qt 日志落盘 exe 同级 scan.log（控制台随进程消失，日志会丢）
 static QFile* g_logFile = nullptr;
 static QMutex g_logMutex;
+static const qint64 kLogRotateBytes = 8 * 1024 * 1024;   // 8MB：超了把当前日志轮转成 scan.log.1
 
 void logToFile(QtMsgType, const QMessageLogContext&, const QString& msg)
 {
@@ -35,8 +35,14 @@ int main(int argc, char *argv[])
 #endif
     QGuiApplication app(argc, argv);
 
-    // 日志文件放 exe 同级目录
-    g_logFile = new QFile(QCoreApplication::applicationDirPath() + "/scan.log");
+    // 日志文件放 exe 同级目录；超过阈值先轮转，只保留上一份（总量封顶 2×阈值）
+    const QString logDir = QCoreApplication::applicationDirPath();
+    if (QFile(logDir + "/scan.log").size() > kLogRotateBytes)
+    {
+        QFile::remove(logDir + "/scan.log.1");
+        QFile::rename(logDir + "/scan.log", logDir + "/scan.log.1");
+    }
+    g_logFile = new QFile(logDir + "/scan.log");
     g_logFile->open(QIODevice::Append | QIODevice::Text);
     qInstallMessageHandler(logToFile);
     qWarning() << "[MAIN] 进程启动";
@@ -59,6 +65,7 @@ int main(int argc, char *argv[])
     qWarning() << "[MAIN] 事件循环开始";
     const int rc = app.exec();
     qWarning() << "[MAIN] 事件循环退出 rc=" << rc;
-    qInstallMessageHandler(nullptr);
+    // 这里不能提前卸载日志处理器：fileInteract / engine 的析构发生在 return 处，
+    // 提前卸载会让整条退出路径变成日志盲区，关窗卡住时无从定位
     return rc;
 }

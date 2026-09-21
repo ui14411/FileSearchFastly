@@ -8,6 +8,7 @@
 #include <QThread>
 #include <functional>
 #include <thread>
+#include <QPointer>
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -92,7 +93,7 @@ signals:
     void scanAllFinished();                                            // 全部盘扫描完成
 
 private:
-    QVector<QThread*> threads;
+    QVector<QPointer<QThread>> threads;
     FileDatabase* m_database = nullptr;
     QThread* m_dbThread = nullptr;
     QList<DriveWatcher*> m_watchers;   // 移动盘运行时监视（析构时停止）

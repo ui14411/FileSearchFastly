@@ -602,7 +602,7 @@ void DriveScanner::incrementalUsn()
     USN_JOURNAL_DATA jd{};
     DWORD bytes = 0;
     if (!DeviceIoControl(hVol, FSCTL_QUERY_USN_JOURNAL, nullptr, 0,
-                         &jd, sizeof(jd), &bytes, nullptr))
+        &jd, sizeof(jd), &bytes, nullptr))
     {
         // U 盘等无 journal → 无增量，跳过
         CloseHandle(hVol);
@@ -610,14 +610,16 @@ void DriveScanner::incrementalUsn()
         return;
     }
 
-    if (m_lastUsn == 0)
+    if (m_lastUsn == 0 || m_lastUsn < jd.FirstUsn || m_lastUsn > jd.NextUsn)
     {
-        // 无基线（降级遍历后首次启动等）：只建立基线，不处理历史
-        qWarning() << "[USN] 增量: " << driveLetter << " 无基线, 建立基线 NextUsn=" << jd.NextUsn;
-        emit sendLastUsn(QString(driveLetter), jd.NextUsn);
+        qWarning() << "[USN] 基线失效: " << driveLetter
+            << " 基线=" << m_lastUsn
+            << " 有效区间=[" << jd.FirstUsn << "," << jd.NextUsn << "]";
         CloseHandle(hVol);
+        emit sendNeedFullRescan(QString(driveLetter));
         emit finished();
         return;
+
     }
 
     qWarning() << "[USN] 增量开始: " << driveLetter << " from Usn=" << m_lastUsn;
@@ -641,6 +643,7 @@ void DriveScanner::incrementalUsn()
     QList<QPair<QString, QString>> renames;   // (旧前缀, 新前缀)
     qint64 recCount = 0;
     qint64 upsertCount = 0, deleteCount = 0, renameCount = 0;
+    bool baselineDead = false;
 
     auto flushAll = [&]()
     {
@@ -673,6 +676,8 @@ void DriveScanner::incrementalUsn()
         {
             const DWORD e = GetLastError();
             qWarning() << "[USN] 增量 READ 失败 err=" << e;
+            if (e == ERROR_JOURNAL_ENTRY_DELETED || e == ERROR_JOURNAL_DELETE_IN_PROGRESS || e == ERROR_JOURNAL_NOT_ACTIVE)
+                baselineDead = true;
             break;   // 保守：不推进基线，下次重读
         }
         if (got <= sizeof(USN))
@@ -823,6 +828,13 @@ void DriveScanner::incrementalUsn()
     qWarning() << "[USN] 增量完成: " << driveLetter << " 记录=" << recCount
                << " upsert=" << upsertCount << " delete=" << deleteCount
                << " rename=" << renameCount << " 新Usn=" << m_lastUsn;
+    if (baselineDead) {
+        //基线已经失效，写回只会固化废值，必须重建
+        CloseHandle(hVol);
+        emit sendNeedFullRescan(QString(driveLetter));
+        emit finished();
+        return;
+    }
     emit sendLastUsn(QString(driveLetter), m_lastUsn);
     CloseHandle(hVol);
     emit finished();

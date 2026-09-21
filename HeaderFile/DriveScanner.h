@@ -56,6 +56,7 @@ signals:
 	void sendFileDelete(const QStringList& paths);
 	void sendRenamePrefix(const QString& oldPrefix, const QString& newPrefix);
 	void sendLastUsn(const QString& drive, quint64 usn);
+	void sendNeedFullRescan(const QString& drive);//保底，当出现基线失效时，启用目录遍历
 
 private:
 	QFileInfo m_drive;
